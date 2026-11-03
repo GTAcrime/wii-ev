@@ -13,17 +13,22 @@ index 3fead14..4a229e5 100644
  if(WIIDRC_LIBRARY)
 diff --git a/src/platform/wii/evnet.c b/src/platform/wii/evnet.c
 new file mode 100644
-index 0000000..eec8f6b
+index 0000000..376acd4
 --- /dev/null
 +++ b/src/platform/wii/evnet.c
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,247 @@
 +/* EV Counter: streams GBA memory over TCP so a PC can read it live.
 + *
 + * The Wii listens on EVNET_PORT. A client receives a stream of messages:
 + *   magic 'EVM1' (4 bytes), GBA address (u32), length (u32)  -- big-endian header
 + *   followed by <length> bytes of GBA memory in GBA (little-endian) byte order.
-+ * Small, important regions are sent every tick; the full IWRAM/EWRAM are sent in
-+ * chunks, so the PC slowly gets a complete picture without hitching the emulator.
++ *
++ * Design goals: it must come up every time, whatever happens.
++ *  - the server thread never exits: it retries the network stack and the listening
++ *    socket until they work, and rebuilds them if the connection layer breaks;
++ *  - the game can be loaded/unloaded/reloaded any number of times;
++ *  - the emulator memory is only touched in short slices, and evnet_stop() waits for
++ *    a slice in progress, so the core can never be freed while it is being read.
 + */
 +#include "evnet.h"
 +
@@ -32,22 +37,39 @@ index 0000000..eec8f6b
 +#include <string.h>
 +#include <unistd.h>
 +
++#ifndef SOL_SOCKET
++#define SOL_SOCKET 0xfff
++#endif
++
 +#define TICK_US 250000
 +#define CHUNK 4096
 +#define EWRAM_BASE 0x02000000
 +#define EWRAM_SIZE 0x40000
 +#define IWRAM_BASE 0x03000000
 +#define IWRAM_SIZE 0x8000
++#define ROM_BASE 0x08000000
++#define ROM_SCAN_LIMIT 0x08800000
 +#define ROM_BASESTATS_SIZE 0x3000 /* gBaseStats (EV yields), located by scanning the ROM */
-+#define MARKER_ADDR 0xFFFFFFF0     /* pseudo address: payload = ROM address of gBaseStats */
-+#define HEADER_ADDR 0x080000A0     /* ROM header (game code at 0xAC) */
-+#define PARTY_BLOCK 0x0202402C     /* covers gEnemyParty+gPlayerParty of FireRed AND Emerald */
++#define SCAN_STEP 0x10000         /* words scanned per tick while looking for gBaseStats */
++#define MARKER_ADDR 0xFFFFFFF0    /* pseudo address: payload = ROM address of gBaseStats */
++#define HEADER_ADDR 0x080000A0    /* ROM header (game code at 0xAC, version at 0xBC) */
++#define PARTY_BLOCK 0x0202402C    /* covers gEnemyParty+gPlayerParty of FireRed AND Emerald */
 +#define PARTY_BLOCK_SIZE 2328
++#define CHUNKS ((IWRAM_SIZE + EWRAM_SIZE + ROM_BASESTATS_SIZE) / CHUNK)
 +
 +static struct mCore* volatile evCore = NULL;
-+static volatile bool evRunning = false;
++static volatile bool evReading = false;      /* the server thread is inside the core right now */
++static volatile bool evReset = true;         /* a (new) game was loaded: forget what we learned */
 +static lwp_t evThread;
-+static bool evThreadStarted = false;
++static volatile bool evThreadStarted = false;
++
++/* learned about the current game */
++static uint32_t evBaseStats = 0;
++static bool evScanDone = false;
++static uint32_t evScanPos = ROM_BASE;
++
++/* one tick worth of data, filled while reading the core, sent afterwards */
++static uint8_t outBuf[(12 + 32) + 16 + (12 + PARTY_BLOCK_SIZE) + 2 * (12 + CHUNK)];
 +
 +static bool sendAll(s32 sock, const void* data, size_t len) {
 +	const uint8_t* p = data;
@@ -62,95 +84,120 @@ index 0000000..eec8f6b
 +	return true;
 +}
 +
-+static uint32_t findBaseStats(struct mCore* core) {
-+	uint32_t a;
-+	for (a = 0x08000000; a < 0x08800000; a += 4) {
-+		/* Bulbasaur's entry (second in the table): 45 49 49 45 65 65, Grass, Poison */
-+		if (core->rawRead32(core, a + 28, -1) == 0x2D31312D && core->rawRead32(core, a + 32, -1) == 0x030C4141) {
-+			return a;
-+		}
-+	}
-+	return 0;
++static size_t appendHeader(size_t pos, uint32_t addr, uint32_t len) {
++	outBuf[pos + 0] = 'E';
++	outBuf[pos + 1] = 'V';
++	outBuf[pos + 2] = 'M';
++	outBuf[pos + 3] = '1';
++	outBuf[pos + 4] = addr >> 24;
++	outBuf[pos + 5] = addr >> 16;
++	outBuf[pos + 6] = addr >> 8;
++	outBuf[pos + 7] = addr;
++	outBuf[pos + 8] = len >> 24;
++	outBuf[pos + 9] = len >> 16;
++	outBuf[pos + 10] = len >> 8;
++	outBuf[pos + 11] = len;
++	return pos + 12;
 +}
 +
-+static bool sendRegion(s32 sock, uint32_t addr, uint32_t len) {
-+	static uint8_t buffer[12 + CHUNK + 600];
-+	struct mCore* core = evCore;
-+	if (!core || len > sizeof(buffer) - 12) {
-+		return true;
-+	}
-+	buffer[0] = 'E';
-+	buffer[1] = 'V';
-+	buffer[2] = 'M';
-+	buffer[3] = '1';
-+	buffer[4] = addr >> 24;
-+	buffer[5] = addr >> 16;
-+	buffer[6] = addr >> 8;
-+	buffer[7] = addr;
-+	buffer[8] = len >> 24;
-+	buffer[9] = len >> 16;
-+	buffer[10] = len >> 8;
-+	buffer[11] = len;
++static size_t appendRegion(size_t pos, struct mCore* core, uint32_t addr, uint32_t len) {
++	pos = appendHeader(pos, addr, len);
 +	uint32_t i;
 +	for (i = 0; i < len; i += 4) {
 +		uint32_t value = core->rawRead32(core, addr + i, -1);
-+		buffer[12 + i] = value;
-+		buffer[12 + i + 1] = value >> 8;
-+		buffer[12 + i + 2] = value >> 16;
-+		buffer[12 + i + 3] = value >> 24;
++		outBuf[pos + i] = value;
++		outBuf[pos + i + 1] = value >> 8;
++		outBuf[pos + i + 2] = value >> 16;
++		outBuf[pos + i + 3] = value >> 24;
 +	}
-+	return sendAll(sock, buffer, 12 + len);
++	return pos + len;
 +}
 +
-+static bool sendMarker(s32 sock, uint32_t value) {
-+	uint8_t buffer[16] = { 'E', 'V', 'M', '1', 0xFF, 0xFF, 0xFF, 0xF0, 0, 0, 0, 4,
-+		value, value >> 8, value >> 16, value >> 24 };
-+	return sendAll(sock, buffer, sizeof(buffer));
++static size_t appendMarker(size_t pos, uint32_t value) {
++	pos = appendHeader(pos, MARKER_ADDR, 4);
++	outBuf[pos] = value;
++	outBuf[pos + 1] = value >> 8;
++	outBuf[pos + 2] = value >> 16;
++	outBuf[pos + 3] = value >> 24;
++	return pos + 4;
++}
++
++/* Look for gBaseStats a slice at a time: Bulbasaur's entry (second in the table) is 45 49 49 45 65 65, Grass, Poison. */
++static void scanSlice(struct mCore* core) {
++	uint32_t end = evScanPos + SCAN_STEP * 4;
++	for (; evScanPos < end && evScanPos < ROM_SCAN_LIMIT; evScanPos += 4) {
++		if (core->rawRead32(core, evScanPos + 28, -1) == 0x2D31312D &&
++		    core->rawRead32(core, evScanPos + 32, -1) == 0x030C4141) {
++			evBaseStats = evScanPos;
++			evScanDone = true;
++			return;
++		}
++	}
++	if (evScanPos >= ROM_SCAN_LIMIT) {
++		evScanDone = true;
++	}
++}
++
++/* Fill outBuf with everything for one tick. Returns the length (0 = no game loaded). */
++static size_t buildTick(uint32_t* chunk) {
++	evReading = true;
++	struct mCore* core = evCore;
++	size_t pos = 0;
++	if (core) {
++		if (evReset) {
++			evReset = false;
++			evBaseStats = 0;
++			evScanDone = false;
++			evScanPos = ROM_BASE;
++		}
++		if (!evScanDone) {
++			scanSlice(core);
++		}
++		pos = appendRegion(pos, core, HEADER_ADDR, 32);
++		pos = appendMarker(pos, evBaseStats);
++		pos = appendRegion(pos, core, PARTY_BLOCK, PARTY_BLOCK_SIZE);
++		int k;
++		for (k = 0; k < 2; ++k) {
++			uint32_t offset = *chunk * CHUNK;
++			*chunk = (*chunk + 1) % CHUNKS;
++			uint32_t addr;
++			if (offset < IWRAM_SIZE) {
++				addr = IWRAM_BASE + offset;
++			} else if (offset < IWRAM_SIZE + EWRAM_SIZE) {
++				addr = EWRAM_BASE + (offset - IWRAM_SIZE);
++			} else if (evBaseStats) {
++				addr = evBaseStats + (offset - IWRAM_SIZE - EWRAM_SIZE);
++			} else {
++				continue;
++			}
++			pos = appendRegion(pos, core, addr, CHUNK);
++		}
++	}
++	evReading = false;
++	return pos;
 +}
 +
 +static void serve(s32 client) {
 +	uint32_t chunk = 0;
-+	uint32_t baseStats = evCore ? findBaseStats(evCore) : 0;
-+	const uint32_t chunks = (IWRAM_SIZE + EWRAM_SIZE + ROM_BASESTATS_SIZE) / CHUNK;
-+	while (evRunning) {
-+		if (evCore) {
-+			if (!sendRegion(client, HEADER_ADDR, 32) || !sendMarker(client, baseStats) ||
-+			    !sendRegion(client, PARTY_BLOCK, PARTY_BLOCK_SIZE)) {
-+				return;
-+			}
-+			int k;
-+			for (k = 0; k < 2; ++k) {
-+				uint32_t offset = chunk * CHUNK;
-+				uint32_t addr;
-+				if (offset < IWRAM_SIZE) {
-+					addr = IWRAM_BASE + offset;
-+				} else if (offset < IWRAM_SIZE + EWRAM_SIZE) {
-+					addr = EWRAM_BASE + (offset - IWRAM_SIZE);
-+				} else if (baseStats) {
-+					addr = baseStats + (offset - IWRAM_SIZE - EWRAM_SIZE);
-+				} else {
-+					chunk = (chunk + 1) % chunks;
-+					continue;
-+				}
-+				if (!sendRegion(client, addr, CHUNK)) {
-+					return;
-+				}
-+				chunk = (chunk + 1) % chunks;
-+			}
++	for (;;) {
++		size_t len = buildTick(&chunk);
++		if (len && !sendAll(client, outBuf, len)) {
++			return;
++		}
++		if (len && !evScanDone) {
++			continue; /* still looking for gBaseStats: keep going without waiting */
 +		}
 +		usleep(TICK_US);
 +	}
 +}
 +
-+static void* evMain(void* arg) {
-+	(void) arg;
-+	if (net_init() < 0) {
-+		return NULL;
-+	}
++static s32 openServer(void) {
 +	s32 server = net_socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
 +	if (server < 0) {
-+		return NULL;
++		return -1;
 +	}
++	int one = 1;
++	net_setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 +	struct sockaddr_in addr;
 +	memset(&addr, 0, sizeof(addr));
 +	addr.sin_len = sizeof(addr);
@@ -159,39 +206,63 @@ index 0000000..eec8f6b
 +	addr.sin_addr.s_addr = INADDR_ANY;
 +	if (net_bind(server, (struct sockaddr*) &addr, sizeof(addr)) < 0 || net_listen(server, 1) < 0) {
 +		net_close(server);
-+		return NULL;
++		return -1;
 +	}
-+	while (evRunning) {
-+		struct sockaddr_in peer;
-+		socklen_t peerLen = sizeof(peer);
-+		s32 client = net_accept(server, (struct sockaddr*) &peer, &peerLen);
-+		if (client < 0) {
-+			usleep(500000);
++	return server;
++}
++
++static void* evMain(void* arg) {
++	(void) arg;
++	for (;;) {
++		/* (re)start the network stack until it works: Wi-Fi may not be up yet */
++		while (net_init() < 0) {
++			sleep(2);
++		}
++		s32 server = openServer();
++		if (server < 0) {
++			net_deinit();
++			sleep(2);
 +			continue;
 +		}
-+		serve(client);
-+		net_close(client);
++		int failures = 0;
++		while (failures < 5) {
++			struct sockaddr_in peer;
++			socklen_t peerLen = sizeof(peer);
++			s32 client = net_accept(server, (struct sockaddr*) &peer, &peerLen);
++			if (client < 0) {
++				++failures;
++				sleep(1);
++				continue;
++			}
++			failures = 0;
++			serve(client);
++			net_close(client);
++		}
++		/* the listening socket looks dead: build everything again */
++		net_close(server);
++		net_deinit();
 +	}
-+	net_close(server);
 +	return NULL;
 +}
 +
 +void evnet_start(struct mCore* core) {
++	evReset = true;
 +	evCore = core;
 +	if (evThreadStarted) {
 +		return;
 +	}
-+	evRunning = true;
 +	if (LWP_CreateThread(&evThread, evMain, NULL, NULL, 16 * 1024, 64) == 0) {
 +		evThreadStarted = true;
-+	} else {
-+		evRunning = false;
 +	}
 +}
 +
 +void evnet_stop(void) {
-+	/* The network thread keeps running (it only waits); it just stops reading emulator memory. */
++	/* The network thread keeps running; it just stops reading emulator memory.
++	 * Wait for a slice that is in progress, because the core is freed right after this returns. */
 +	evCore = NULL;
++	while (evReading) {
++		usleep(1000);
++	}
 +}
 diff --git a/src/platform/wii/evnet.h b/src/platform/wii/evnet.h
 new file mode 100644
