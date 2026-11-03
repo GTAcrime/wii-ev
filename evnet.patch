@@ -13,10 +13,10 @@ index 3fead14..4a229e5 100644
  if(WIIDRC_LIBRARY)
 diff --git a/src/platform/wii/evnet.c b/src/platform/wii/evnet.c
 new file mode 100644
-index 0000000..376acd4
+index 0000000..9a09e7a
 --- /dev/null
 +++ b/src/platform/wii/evnet.c
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,312 @@
 +/* EV Counter: streams GBA memory over TCP so a PC can read it live.
 + *
 + * The Wii listens on EVNET_PORT. A client receives a stream of messages:
@@ -34,8 +34,43 @@ index 0000000..376acd4
 +
 +#include <network.h>
 +#include <ogcsys.h>
++#include <stdarg.h>
++#include <stdio.h>
 +#include <string.h>
 +#include <unistd.h>
++
++/* Event log written to the SD card root, so a failure can be read on the PC afterwards. */
++#ifndef EVNET_LOG_PATH
++#define EVNET_LOG_PATH "sd:/evnet.log"
++#endif
++#ifndef EVNET_LOG_PATH2
++#define EVNET_LOG_PATH2 "usb:/evnet.log"
++#endif
++#ifndef EVNET_PRIORITY
++#define EVNET_PRIORITY 90 /* above mGBA's own thread: this thread sleeps almost all the time */
++#endif
++#define EVNET_LOG_MAX_LINES 400
++
++static int evLogLines = 0;
++static void evlog(const char* fmt, ...) {
++	if (evLogLines >= EVNET_LOG_MAX_LINES) {
++		return;
++	}
++	char line[200];
++	va_list args;
++	va_start(args, fmt);
++	vsnprintf(line, sizeof(line), fmt, args);
++	va_end(args);
++	FILE* f = fopen(EVNET_LOG_PATH, "a");
++	if (!f) {
++		f = fopen(EVNET_LOG_PATH2, "a");
++	}
++	if (f) {
++		fprintf(f, "%s\n", line);
++		fclose(f);
++		++evLogLines;
++	}
++}
 +
 +#ifndef SOL_SOCKET
 +#define SOL_SOCKET 0xfff
@@ -179,9 +214,11 @@ index 0000000..376acd4
 +
 +static void serve(s32 client) {
 +	uint32_t chunk = 0;
++	evlog("client connected");
 +	for (;;) {
 +		size_t len = buildTick(&chunk);
 +		if (len && !sendAll(client, outBuf, len)) {
++			evlog("client gone (send failed)");
 +			return;
 +		}
 +		if (len && !evScanDone) {
@@ -194,30 +231,50 @@ index 0000000..376acd4
 +static s32 openServer(void) {
 +	s32 server = net_socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
 +	if (server < 0) {
++		evlog("net_socket failed: %d", (int) server);
 +		return -1;
 +	}
 +	int one = 1;
-+	net_setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++	s32 opt = net_setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++	if (opt < 0) {
++		evlog("SO_REUSEADDR not accepted (%d), continuing", (int) opt);
++	}
 +	struct sockaddr_in addr;
 +	memset(&addr, 0, sizeof(addr));
 +	addr.sin_len = sizeof(addr);
 +	addr.sin_family = AF_INET;
 +	addr.sin_port = htons(EVNET_PORT);
 +	addr.sin_addr.s_addr = INADDR_ANY;
-+	if (net_bind(server, (struct sockaddr*) &addr, sizeof(addr)) < 0 || net_listen(server, 1) < 0) {
++	s32 res = net_bind(server, (struct sockaddr*) &addr, sizeof(addr));
++	if (res < 0) {
++		evlog("net_bind failed: %d", (int) res);
 +		net_close(server);
 +		return -1;
 +	}
++	res = net_listen(server, 1);
++	if (res < 0) {
++		evlog("net_listen failed: %d", (int) res);
++		net_close(server);
++		return -1;
++	}
++	evlog("listening on port %d", EVNET_PORT);
 +	return server;
 +}
 +
 +static void* evMain(void* arg) {
 +	(void) arg;
++	evlog("server thread running");
 +	for (;;) {
 +		/* (re)start the network stack until it works: Wi-Fi may not be up yet */
-+		while (net_init() < 0) {
++		int tries = 0;
++		s32 res;
++		while ((res = net_init()) < 0) {
++			if (tries++ < 20) {
++				evlog("net_init failed: %d (try %d)", (int) res, tries);
++			}
 +			sleep(2);
 +		}
++		evlog("net_init ok");
 +		s32 server = openServer();
 +		if (server < 0) {
 +			net_deinit();
@@ -231,6 +288,7 @@ index 0000000..376acd4
 +			s32 client = net_accept(server, (struct sockaddr*) &peer, &peerLen);
 +			if (client < 0) {
 +				++failures;
++				evlog("net_accept failed: %d (failure %d)", (int) client, failures);
 +				sleep(1);
 +				continue;
 +			}
@@ -239,6 +297,7 @@ index 0000000..376acd4
 +			net_close(client);
 +		}
 +		/* the listening socket looks dead: build everything again */
++		evlog("rebuilding the network stack");
 +		net_close(server);
 +		net_deinit();
 +	}
@@ -249,10 +308,15 @@ index 0000000..376acd4
 +	evReset = true;
 +	evCore = core;
 +	if (evThreadStarted) {
++		evlog("game loaded (server thread already running)");
 +		return;
 +	}
-+	if (LWP_CreateThread(&evThread, evMain, NULL, NULL, 16 * 1024, 64) == 0) {
++	s32 res = LWP_CreateThread(&evThread, evMain, NULL, NULL, 16 * 1024, EVNET_PRIORITY);
++	if (res == 0) {
 +		evThreadStarted = true;
++		evlog("game loaded, server thread created");
++	} else {
++		evlog("LWP_CreateThread failed: %d", (int) res);
 +	}
 +}
 +
@@ -263,6 +327,7 @@ index 0000000..376acd4
 +	while (evReading) {
 +		usleep(1000);
 +	}
++	evlog("game unloaded");
 +}
 diff --git a/src/platform/wii/evnet.h b/src/platform/wii/evnet.h
 new file mode 100644
