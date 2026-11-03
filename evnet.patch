@@ -1,0 +1,241 @@
+diff --git a/src/platform/wii/CMakeLists.txt b/src/platform/wii/CMakeLists.txt
+index 3fead14..4a229e5 100644
+--- a/src/platform/wii/CMakeLists.txt
++++ b/src/platform/wii/CMakeLists.txt
+@@ -22,7 +22,7 @@ set(OS_DEFINES ${OS_DEFINES} PARENT_SCOPE)
+ list(APPEND GUI_SRC ${CMAKE_CURRENT_BINARY_DIR}/font.c ${CMAKE_CURRENT_BINARY_DIR}/icons.c ${CMAKE_CURRENT_SOURCE_DIR}/gui-font.c)
+ 
+ set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/font.c PROPERTIES GENERATED ON)
+-add_executable(${BINARY_NAME}.elf ${GUI_SRC} main.c)
++add_executable(${BINARY_NAME}.elf ${GUI_SRC} main.c evnet.c)
+ set_target_properties(${BINARY_NAME}.elf PROPERTIES COMPILE_DEFINITIONS "${OS_DEFINES};${FEATURE_DEFINES};${FUNCTION_DEFINES}")
+ target_link_libraries(${BINARY_NAME}.elf ${BINARY_NAME} ${OS_LIB})
+ if(WIIDRC_LIBRARY)
+diff --git a/src/platform/wii/evnet.c b/src/platform/wii/evnet.c
+new file mode 100644
+index 0000000..eec8f6b
+--- /dev/null
++++ b/src/platform/wii/evnet.c
+@@ -0,0 +1,176 @@
++/* EV Counter: streams GBA memory over TCP so a PC can read it live.
++ *
++ * The Wii listens on EVNET_PORT. A client receives a stream of messages:
++ *   magic 'EVM1' (4 bytes), GBA address (u32), length (u32)  -- big-endian header
++ *   followed by <length> bytes of GBA memory in GBA (little-endian) byte order.
++ * Small, important regions are sent every tick; the full IWRAM/EWRAM are sent in
++ * chunks, so the PC slowly gets a complete picture without hitching the emulator.
++ */
++#include "evnet.h"
++
++#include <network.h>
++#include <ogcsys.h>
++#include <string.h>
++#include <unistd.h>
++
++#define TICK_US 250000
++#define CHUNK 4096
++#define EWRAM_BASE 0x02000000
++#define EWRAM_SIZE 0x40000
++#define IWRAM_BASE 0x03000000
++#define IWRAM_SIZE 0x8000
++#define ROM_BASESTATS_SIZE 0x3000 /* gBaseStats (EV yields), located by scanning the ROM */
++#define MARKER_ADDR 0xFFFFFFF0     /* pseudo address: payload = ROM address of gBaseStats */
++#define HEADER_ADDR 0x080000A0     /* ROM header (game code at 0xAC) */
++#define PARTY_BLOCK 0x0202402C     /* covers gEnemyParty+gPlayerParty of FireRed AND Emerald */
++#define PARTY_BLOCK_SIZE 2328
++
++static struct mCore* volatile evCore = NULL;
++static volatile bool evRunning = false;
++static lwp_t evThread;
++static bool evThreadStarted = false;
++
++static bool sendAll(s32 sock, const void* data, size_t len) {
++	const uint8_t* p = data;
++	while (len > 0) {
++		s32 n = net_send(sock, p, len > 1024 ? 1024 : (s32) len, 0);
++		if (n <= 0) {
++			return false;
++		}
++		p += n;
++		len -= n;
++	}
++	return true;
++}
++
++static uint32_t findBaseStats(struct mCore* core) {
++	uint32_t a;
++	for (a = 0x08000000; a < 0x08800000; a += 4) {
++		/* Bulbasaur's entry (second in the table): 45 49 49 45 65 65, Grass, Poison */
++		if (core->rawRead32(core, a + 28, -1) == 0x2D31312D && core->rawRead32(core, a + 32, -1) == 0x030C4141) {
++			return a;
++		}
++	}
++	return 0;
++}
++
++static bool sendRegion(s32 sock, uint32_t addr, uint32_t len) {
++	static uint8_t buffer[12 + CHUNK + 600];
++	struct mCore* core = evCore;
++	if (!core || len > sizeof(buffer) - 12) {
++		return true;
++	}
++	buffer[0] = 'E';
++	buffer[1] = 'V';
++	buffer[2] = 'M';
++	buffer[3] = '1';
++	buffer[4] = addr >> 24;
++	buffer[5] = addr >> 16;
++	buffer[6] = addr >> 8;
++	buffer[7] = addr;
++	buffer[8] = len >> 24;
++	buffer[9] = len >> 16;
++	buffer[10] = len >> 8;
++	buffer[11] = len;
++	uint32_t i;
++	for (i = 0; i < len; i += 4) {
++		uint32_t value = core->rawRead32(core, addr + i, -1);
++		buffer[12 + i] = value;
++		buffer[12 + i + 1] = value >> 8;
++		buffer[12 + i + 2] = value >> 16;
++		buffer[12 + i + 3] = value >> 24;
++	}
++	return sendAll(sock, buffer, 12 + len);
++}
++
++static bool sendMarker(s32 sock, uint32_t value) {
++	uint8_t buffer[16] = { 'E', 'V', 'M', '1', 0xFF, 0xFF, 0xFF, 0xF0, 0, 0, 0, 4,
++		value, value >> 8, value >> 16, value >> 24 };
++	return sendAll(sock, buffer, sizeof(buffer));
++}
++
++static void serve(s32 client) {
++	uint32_t chunk = 0;
++	uint32_t baseStats = evCore ? findBaseStats(evCore) : 0;
++	const uint32_t chunks = (IWRAM_SIZE + EWRAM_SIZE + ROM_BASESTATS_SIZE) / CHUNK;
++	while (evRunning) {
++		if (evCore) {
++			if (!sendRegion(client, HEADER_ADDR, 32) || !sendMarker(client, baseStats) ||
++			    !sendRegion(client, PARTY_BLOCK, PARTY_BLOCK_SIZE)) {
++				return;
++			}
++			int k;
++			for (k = 0; k < 2; ++k) {
++				uint32_t offset = chunk * CHUNK;
++				uint32_t addr;
++				if (offset < IWRAM_SIZE) {
++					addr = IWRAM_BASE + offset;
++				} else if (offset < IWRAM_SIZE + EWRAM_SIZE) {
++					addr = EWRAM_BASE + (offset - IWRAM_SIZE);
++				} else if (baseStats) {
++					addr = baseStats + (offset - IWRAM_SIZE - EWRAM_SIZE);
++				} else {
++					chunk = (chunk + 1) % chunks;
++					continue;
++				}
++				if (!sendRegion(client, addr, CHUNK)) {
++					return;
++				}
++				chunk = (chunk + 1) % chunks;
++			}
++		}
++		usleep(TICK_US);
++	}
++}
++
++static void* evMain(void* arg) {
++	(void) arg;
++	if (net_init() < 0) {
++		return NULL;
++	}
++	s32 server = net_socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
++	if (server < 0) {
++		return NULL;
++	}
++	struct sockaddr_in addr;
++	memset(&addr, 0, sizeof(addr));
++	addr.sin_len = sizeof(addr);
++	addr.sin_family = AF_INET;
++	addr.sin_port = htons(EVNET_PORT);
++	addr.sin_addr.s_addr = INADDR_ANY;
++	if (net_bind(server, (struct sockaddr*) &addr, sizeof(addr)) < 0 || net_listen(server, 1) < 0) {
++		net_close(server);
++		return NULL;
++	}
++	while (evRunning) {
++		struct sockaddr_in peer;
++		socklen_t peerLen = sizeof(peer);
++		s32 client = net_accept(server, (struct sockaddr*) &peer, &peerLen);
++		if (client < 0) {
++			usleep(500000);
++			continue;
++		}
++		serve(client);
++		net_close(client);
++	}
++	net_close(server);
++	return NULL;
++}
++
++void evnet_start(struct mCore* core) {
++	evCore = core;
++	if (evThreadStarted) {
++		return;
++	}
++	evRunning = true;
++	if (LWP_CreateThread(&evThread, evMain, NULL, NULL, 16 * 1024, 64) == 0) {
++		evThreadStarted = true;
++	} else {
++		evRunning = false;
++	}
++}
++
++void evnet_stop(void) {
++	/* The network thread keeps running (it only waits); it just stops reading emulator memory. */
++	evCore = NULL;
++}
+diff --git a/src/platform/wii/evnet.h b/src/platform/wii/evnet.h
+new file mode 100644
+index 0000000..d4f6fc5
+--- /dev/null
++++ b/src/platform/wii/evnet.h
+@@ -0,0 +1,12 @@
++/* EV Counter: streams GBA memory over TCP so a PC can read it live. */
++#ifndef EVNET_H
++#define EVNET_H
++
++#include <mgba/core/core.h>
++
++#define EVNET_PORT 5555
++
++void evnet_start(struct mCore* core);
++void evnet_stop(void);
++
++#endif
+diff --git a/src/platform/wii/main.c b/src/platform/wii/main.c
+index 4cdbc33..4f61020 100644
+--- a/src/platform/wii/main.c
++++ b/src/platform/wii/main.c
+@@ -17,6 +17,7 @@
+ #include <mgba/core/blip_buf.h>
+ #include <mgba/core/core.h>
+ #include "feature/gui/gui-runner.h"
++#include "evnet.h"
+ #include <mgba/internal/gb/video.h>
+ #include <mgba/internal/gba/audio.h>
+ #include <mgba/internal/gba/gba.h>
+@@ -1434,6 +1435,7 @@ void _setup(struct mGUIRunner* runner) {
+ 
+ void _gameUnloaded(struct mGUIRunner* runner) {
+ 	UNUSED(runner);
++	evnet_stop();
+ 	AUDIO_StopDMA();
+ 	frameLimiter = true;
+ 	VIDEO_SetBlack(true);
+@@ -1442,6 +1444,7 @@ void _gameUnloaded(struct mGUIRunner* runner) {
+ }
+ 
+ void _gameLoaded(struct mGUIRunner* runner) {
++	evnet_start(runner->core);
+ 	reconfigureScreen(runner);
+ 	if (runner->core->platform(runner->core) == mPLATFORM_GBA && ((struct GBA*) runner->core->board)->memory.hw.devices & HW_GYRO) {
+ 		int i;
