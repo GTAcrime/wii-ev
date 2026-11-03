@@ -13,10 +13,10 @@ index 3fead14..4a229e5 100644
  if(WIIDRC_LIBRARY)
 diff --git a/src/platform/wii/evnet.c b/src/platform/wii/evnet.c
 new file mode 100644
-index 0000000..9a09e7a
+index 0000000..8e60c48
 --- /dev/null
 +++ b/src/platform/wii/evnet.c
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,358 @@
 +/* EV Counter: streams GBA memory over TCP so a PC can read it live.
 + *
 + * The Wii listens on EVNET_PORT. A client receives a stream of messages:
@@ -36,6 +36,7 @@ index 0000000..9a09e7a
 +#include <ogcsys.h>
 +#include <stdarg.h>
 +#include <stdio.h>
++#include <stdlib.h>
 +#include <string.h>
 +#include <unistd.h>
 +
@@ -50,6 +51,7 @@ index 0000000..9a09e7a
 +#define EVNET_PRIORITY 90 /* above mGBA's own thread: this thread sleeps almost all the time */
 +#endif
 +#define EVNET_LOG_MAX_LINES 400
++#define EVNET_PORT_COUNT 10 /* try EVNET_PORT .. EVNET_PORT+9: a stale socket may still hold the first ones */
 +
 +static int evLogLines = 0;
 +static void evlog(const char* fmt, ...) {
@@ -102,6 +104,12 @@ index 0000000..9a09e7a
 +static uint32_t evBaseStats = 0;
 +static bool evScanDone = false;
 +static uint32_t evScanPos = ROM_BASE;
++static bool evScanning = false;
++
++/* sockets, so they can be closed when mGBA exits (a leaked listening socket blocks the port until reboot) */
++static s32 evServerSock = -1;
++static s32 evClientSock = -1;
++static bool evAtExitSet = false;
 +
 +/* one tick worth of data, filled while reading the core, sent afterwards */
 +static uint8_t outBuf[(12 + 32) + 16 + (12 + PARTY_BLOCK_SIZE) + 2 * (12 + CHUNK)];
@@ -208,6 +216,10 @@ index 0000000..9a09e7a
 +			pos = appendRegion(pos, core, addr, CHUNK);
 +		}
 +	}
++	if (!core) {
++		pos = appendMarker(pos, 0);   /* "alive, no game loaded" */
++	}
++	evScanning = core && !evScanDone;
 +	evReading = false;
 +	return pos;
 +}
@@ -221,14 +233,28 @@ index 0000000..9a09e7a
 +			evlog("client gone (send failed)");
 +			return;
 +		}
-+		if (len && !evScanDone) {
++		if (evScanning) {
 +			continue; /* still looking for gBaseStats: keep going without waiting */
 +		}
 +		usleep(TICK_US);
 +	}
 +}
 +
++static s32 openServerOn(int port);
++
 +static s32 openServer(void) {
++	int port;
++	for (port = EVNET_PORT; port < EVNET_PORT + EVNET_PORT_COUNT; ++port) {
++		s32 server = openServerOn(port);
++		if (server >= 0) {
++			return server;
++		}
++	}
++	evlog("no free port in %d..%d", EVNET_PORT, EVNET_PORT + EVNET_PORT_COUNT - 1);
++	return -1;
++}
++
++static s32 openServerOn(int port) {
 +	s32 server = net_socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
 +	if (server < 0) {
 +		evlog("net_socket failed: %d", (int) server);
@@ -243,21 +269,21 @@ index 0000000..9a09e7a
 +	memset(&addr, 0, sizeof(addr));
 +	addr.sin_len = sizeof(addr);
 +	addr.sin_family = AF_INET;
-+	addr.sin_port = htons(EVNET_PORT);
++	addr.sin_port = htons(port);
 +	addr.sin_addr.s_addr = INADDR_ANY;
 +	s32 res = net_bind(server, (struct sockaddr*) &addr, sizeof(addr));
 +	if (res < 0) {
-+		evlog("net_bind failed: %d", (int) res);
++		evlog("net_bind failed on port %d: %d", port, (int) res);
 +		net_close(server);
 +		return -1;
 +	}
 +	res = net_listen(server, 1);
 +	if (res < 0) {
-+		evlog("net_listen failed: %d", (int) res);
++		evlog("net_listen failed on port %d: %d", port, (int) res);
 +		net_close(server);
 +		return -1;
 +	}
-+	evlog("listening on port %d", EVNET_PORT);
++	evlog("listening on port %d", port);
 +	return server;
 +}
 +
@@ -281,6 +307,7 @@ index 0000000..9a09e7a
 +			sleep(2);
 +			continue;
 +		}
++		evServerSock = server;
 +		int failures = 0;
 +		while (failures < 5) {
 +			struct sockaddr_in peer;
@@ -293,18 +320,37 @@ index 0000000..9a09e7a
 +				continue;
 +			}
 +			failures = 0;
++			evClientSock = client;
 +			serve(client);
++			evClientSock = -1;
 +			net_close(client);
 +		}
 +		/* the listening socket looks dead: build everything again */
 +		evlog("rebuilding the network stack");
++		evServerSock = -1;
 +		net_close(server);
 +		net_deinit();
 +	}
 +	return NULL;
 +}
 +
++static void evAtExit(void) {
++	/* mGBA is leaving: release the sockets, otherwise the Wii's network stack may keep them */
++	if (evClientSock >= 0) {
++		net_close(evClientSock);
++	}
++	if (evServerSock >= 0) {
++		net_close(evServerSock);
++	}
++	net_deinit();
++	evlog("exit: sockets released");
++}
++
 +void evnet_start(struct mCore* core) {
++	if (!evAtExitSet) {
++		evAtExitSet = true;
++		atexit(evAtExit);
++	}
 +	evReset = true;
 +	evCore = core;
 +	if (evThreadStarted) {
