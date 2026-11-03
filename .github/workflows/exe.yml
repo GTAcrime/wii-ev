@@ -1,0 +1,29 @@
+name: Build EV Counter exe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Get the repository (contains ev_counter.py)
+        uses: actions/checkout@v4
+
+      - name: Python with tkinter
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build the exe
+        run: pyinstaller --onefile --windowed --name EVCounter ev_counter.py
+
+      - name: Upload the result
+        uses: actions/upload-artifact@v4
+        with:
+          name: EVCounter
+          path: dist/EVCounter.exe
+          if-no-files-found: error
