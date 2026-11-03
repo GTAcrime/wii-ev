@@ -1,0 +1,36 @@
+name: Build mGBA Wii
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the repository (contains evnet.patch)
+        uses: actions/checkout@v4
+
+      - name: Get mGBA 0.10.5 sources
+        run: git clone --depth 1 --branch 0.10.5 https://github.com/mgba-emu/mgba.git mgba-src
+
+      - name: Apply the EV patch
+        run: |
+          cd mgba-src
+          git apply ../evnet.patch
+          git status --short
+
+      - name: Build for Wii
+        run: |
+          chmod -R a+rwX mgba-src
+          cd mgba-src
+          docker run --rm -v "$PWD":/home/mgba/src mgba/wii
+
+      - name: List build output
+        run: find mgba-src -name "*.dol"
+
+      - name: Upload the result
+        uses: actions/upload-artifact@v4
+        with:
+          name: mgba-wii
+          path: mgba-src/build-*/**/*.dol
+          if-no-files-found: error
