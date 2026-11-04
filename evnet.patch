@@ -13,15 +13,24 @@ index 3fead14..4a229e5 100644
  if(WIIDRC_LIBRARY)
 diff --git a/src/platform/wii/evnet.c b/src/platform/wii/evnet.c
 new file mode 100644
-index 0000000..8e60c48
+index 0000000..ee90726
 --- /dev/null
 +++ b/src/platform/wii/evnet.c
-@@ -0,0 +1,358 @@
+@@ -0,0 +1,702 @@
 +/* EV Counter: streams GBA memory over TCP so a PC can read it live.
 + *
 + * The Wii listens on EVNET_PORT. A client receives a stream of messages:
 + *   magic 'EVM1' (4 bytes), GBA address (u32), length (u32)  -- big-endian header
 + *   followed by <length> bytes of GBA memory in GBA (little-endian) byte order.
++ *
++ * Video (WiiScreen on the PC): a second server on EVNET_VIDEO_PORT sends the emulated screen, one message
++ * per emulated frame:
++ *   magic 'EVF1', frame number (u32), width (u16), height (u16), payload length (u32)  -- big-endian
++ *   payload: changed-row bit mask ((height + 7) / 8 bytes, bit 7 of byte 0 = row 0), then one LZ4 block
++ *   holding the changed rows one after another, pixels RGB565 big-endian (as in mGBA's output buffer).
++ *   A message with width 0 / height 0 and no payload is a keep-alive (no game running).
++ * The video thread runs BELOW the emulator's priority and takes the newest frame each time, so a slow
++ * network only lowers the frame rate on the PC; the game never waits for it. Port 5555 is unchanged.
 + *
 + * Design goals: it must come up every time, whatever happens.
 + *  - the server thread never exits: it retries the network stack and the listening
@@ -32,8 +41,11 @@ index 0000000..8e60c48
 + */
 +#include "evnet.h"
 +
++#include <errno.h>
 +#include <network.h>
 +#include <ogcsys.h>
++#include <ogc/lwp.h>
++#include <ogc/mutex.h>
 +#include <stdarg.h>
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -287,6 +299,317 @@ index 0000000..8e60c48
 +	return server;
 +}
 +
++/* ------------------------------------------------------------------------------------------------ */
++/* Video: the emulated screen on a second port                                                      */
++/* ------------------------------------------------------------------------------------------------ */
++
++#ifndef EVNET_VIDEO_PORT
++#define EVNET_VIDEO_PORT 5600
++#endif
++#define VIDEO_PORT_COUNT 10
++#ifndef VIDEO_PRIORITY
++#define VIDEO_PRIORITY 20         /* below the emulator: it only gets time the game does not need */
++#endif
++#define VIDEO_MAX_W 240
++#define VIDEO_MAX_H 160
++#define VIDEO_PIXELS (VIDEO_MAX_W * VIDEO_MAX_H)
++#define VIDEO_SEND_CHUNK 8192
++#define VIDEO_KEEPALIVE_US 1000000
++#define VIDEO_HEADER 16
++#define VIDEO_MASK_MAX ((VIDEO_MAX_H + 7) / 8)
++#define LZ4_BOUND(n) ((n) + (n) / 255 + 16)
++#define LZ4_HASH_BITS 12
++#ifndef IOS_O_NONBLOCK
++#define IOS_O_NONBLOCK 0x04
++#endif
++#ifndef F_GETFL
++#define F_GETFL 3
++#endif
++#ifndef F_SETFL
++#define F_SETFL 4
++#endif
++
++static volatile bool evNetUp = false;            /* set by evMain while the network stack is usable */
++
++static uint16_t vidShared[VIDEO_PIXELS];          /* newest frame, written by the emulator thread */
++static uint16_t vidWork[VIDEO_PIXELS];            /* the frame being encoded */
++static uint16_t vidPrev[VIDEO_PIXELS];            /* the last frame the client has */
++static uint8_t vidRows[VIDEO_PIXELS * 2];         /* changed rows, back to back */
++static uint8_t vidOut[VIDEO_HEADER + VIDEO_MASK_MAX + LZ4_BOUND(VIDEO_PIXELS * 2)];
++static uint32_t lz4Table[1 << LZ4_HASH_BITS];
++static volatile uint32_t vidSeq = 0;
++static volatile unsigned vidW = 0, vidH = 0;
++static volatile bool vidWanted = false;           /* a client is connected: only then frames are copied */
++static mutex_t vidLock = LWP_MUTEX_NULL;
++static lwp_t vidThread;
++static s32 vidServerSock = -1;
++static s32 vidClientSock = -1;
++
++/* Called by the emulator thread for every drawn frame. Never waits: if the video thread is copying the
++ * previous frame right now, this one is skipped. */
++void evnet_frame(const void* pixels, unsigned stride, unsigned w, unsigned h) {
++	if (!vidWanted || !pixels || vidLock == LWP_MUTEX_NULL) {
++		return;
++	}
++	if (w > VIDEO_MAX_W) {
++		w = VIDEO_MAX_W;
++	}
++	if (h > VIDEO_MAX_H) {
++		h = VIDEO_MAX_H;
++	}
++	if (LWP_MutexTryLock(vidLock) != 0) {
++		return;
++	}
++	const uint16_t* src = pixels;
++	unsigned y;
++	for (y = 0; y < h; ++y) {
++		memcpy(&vidShared[y * w], &src[y * stride], w * 2);
++	}
++	vidW = w;
++	vidH = h;
++	++vidSeq;
++	LWP_MutexUnlock(vidLock);
++}
++
++static inline uint32_t rd32(const uint8_t* p) {
++	uint32_t v;
++	memcpy(&v, p, 4);
++	return v;
++}
++
++static inline uint32_t lz4Hash(uint32_t v) {
++	return (v * 2654435761u) >> (32 - LZ4_HASH_BITS);
++}
++
++static uint8_t* lz4Len(uint8_t* op, size_t len) {
++	while (len >= 255) {
++		*op++ = 255;
++		len -= 255;
++	}
++	*op++ = (uint8_t) len;
++	return op;
++}
++
++/* Plain greedy LZ4 block compressor (standard block format, decodable by any LZ4 decoder). */
++static size_t lz4Compress(const uint8_t* src, size_t n, uint8_t* dst) {
++	const uint8_t* ip = src;
++	const uint8_t* anchor = src;
++	const uint8_t* const end = src + n;
++	uint8_t* op = dst;
++	if (n >= 13) {
++		const uint8_t* const mflimit = end - 12;     /* a match must start 12+ bytes before the end */
++		const uint8_t* const matchlimit = end - 5;   /* the last 5 bytes are always literals */
++		unsigned misses = 0;
++		memset(lz4Table, 0, sizeof(lz4Table));
++		while (ip < mflimit) {
++			uint32_t seq = rd32(ip);
++			uint32_t h = lz4Hash(seq);
++			const uint8_t* ref = src + lz4Table[h];
++			lz4Table[h] = (uint32_t) (ip - src);
++			if (ref >= ip || ip - ref > 65535 || rd32(ref) != seq) {
++				ip += 1 + (misses++ >> 6);           /* skip faster through data that does not compress */
++				continue;
++			}
++			misses = 0;
++			const uint8_t* mp = ip + 4;
++			const uint8_t* rp = ref + 4;
++			while (mp < matchlimit && *mp == *rp) {
++				++mp;
++				++rp;
++			}
++			size_t lit = ip - anchor;
++			size_t mlen = mp - ip - 4;
++			uint8_t* token = op++;
++			*token = (uint8_t) ((lit >= 15 ? 15 : lit) << 4);
++			if (lit >= 15) {
++				op = lz4Len(op, lit - 15);
++			}
++			memcpy(op, anchor, lit);
++			op += lit;
++			uint32_t off = (uint32_t) (ip - ref);
++			*op++ = off & 0xFF;
++			*op++ = off >> 8;
++			*token |= (uint8_t) (mlen >= 15 ? 15 : mlen);
++			if (mlen >= 15) {
++				op = lz4Len(op, mlen - 15);
++			}
++			ip = mp;
++			anchor = ip;
++		}
++	}
++	size_t lit = end - anchor;
++	uint8_t* token = op++;
++	*token = (uint8_t) ((lit >= 15 ? 15 : lit) << 4);
++	if (lit >= 15) {
++		op = lz4Len(op, lit - 15);
++	}
++	memcpy(op, anchor, lit);
++	op += lit;
++	return op - dst;
++}
++
++static void putHeader(uint32_t seq, unsigned w, unsigned h, uint32_t len) {
++	uint8_t* p = vidOut;
++	p[0] = 'E';
++	p[1] = 'V';
++	p[2] = 'F';
++	p[3] = '1';
++	p[4] = seq >> 24;
++	p[5] = seq >> 16;
++	p[6] = seq >> 8;
++	p[7] = seq;
++	p[8] = w >> 8;
++	p[9] = w;
++	p[10] = h >> 8;
++	p[11] = h;
++	p[12] = len >> 24;
++	p[13] = len >> 16;
++	p[14] = len >> 8;
++	p[15] = len;
++}
++
++/* Build the message for vidWork into vidOut: only rows that differ from vidPrev (all rows when full). */
++static size_t vidEncode(uint32_t seq, unsigned w, unsigned h, bool full) {
++	size_t maskLen = (h + 7) / 8;
++	uint8_t* mask = vidOut + VIDEO_HEADER;
++	size_t rowBytes = w * 2;
++	size_t n = 0;
++	unsigned y;
++	memset(mask, 0, maskLen);
++	for (y = 0; y < h; ++y) {
++		const uint16_t* row = &vidWork[y * w];
++		uint16_t* prev = &vidPrev[y * w];
++		if (full || memcmp(row, prev, rowBytes) != 0) {
++			mask[y >> 3] |= 0x80 >> (y & 7);
++			memcpy(&vidRows[n], row, rowBytes);
++			memcpy(prev, row, rowBytes);
++			n += rowBytes;
++		}
++	}
++	size_t packed = n ? lz4Compress(vidRows, n, mask + maskLen) : 0;
++	putHeader(seq, w, h, (uint32_t) (maskLen + packed));
++	return VIDEO_HEADER + maskLen + packed;
++}
++
++static bool vidSendAll(s32 sock, const uint8_t* p, size_t len) {
++	while (len > 0) {
++		s32 n = net_send(sock, p, len > VIDEO_SEND_CHUNK ? VIDEO_SEND_CHUNK : (s32) len, 0);
++		if (n <= 0) {
++			return false;
++		}
++		p += n;
++		len -= n;
++	}
++	return true;
++}
++
++static void vidServe(s32 client) {
++	uint32_t lastSeq = vidSeq;
++	unsigned lastW = 0, lastH = 0;
++	unsigned idle = 0;
++	evlog("video client connected");
++	vidWanted = true;
++	for (;;) {
++		if (vidSeq == lastSeq || !evCore) {
++			usleep(2000);
++			idle += 2000;
++			if (idle >= VIDEO_KEEPALIVE_US) {         /* no frames (menu / no game): tell the PC we are alive */
++				idle = 0;
++				putHeader(lastSeq, 0, 0, 0);
++				if (!vidSendAll(client, vidOut, VIDEO_HEADER)) {
++					break;
++				}
++			}
++			continue;
++		}
++		idle = 0;
++		LWP_MutexLock(vidLock);
++		unsigned w = vidW, h = vidH;
++		uint32_t seq = vidSeq;
++		memcpy(vidWork, vidShared, w * h * 2);
++		LWP_MutexUnlock(vidLock);
++		lastSeq = seq;
++		bool full = w != lastW || h != lastH;          /* first frame, or the screen size changed */
++		lastW = w;
++		lastH = h;
++		size_t len = vidEncode(seq, w, h, full);
++		if (!vidSendAll(client, vidOut, len)) {
++			break;
++		}
++	}
++	vidWanted = false;
++	evlog("video client gone");
++}
++
++static s32 vidOpenServer(void) {
++	int port;
++	for (port = EVNET_VIDEO_PORT; port < EVNET_VIDEO_PORT + VIDEO_PORT_COUNT; ++port) {
++		s32 server = net_socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
++		if (server < 0) {
++			evlog("video net_socket failed: %d", (int) server);
++			return -1;
++		}
++		int one = 1;
++		net_setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++		struct sockaddr_in addr;
++		memset(&addr, 0, sizeof(addr));
++		addr.sin_len = sizeof(addr);
++		addr.sin_family = AF_INET;
++		addr.sin_port = htons(port);
++		addr.sin_addr.s_addr = INADDR_ANY;
++		if (net_bind(server, (struct sockaddr*) &addr, sizeof(addr)) < 0 || net_listen(server, 1) < 0) {
++			net_close(server);
++			continue;
++		}
++		/* non-blocking accept: a waiting video socket must never hold up the IOS network calls of port 5555 */
++		s32 flags = net_fcntl(server, F_GETFL, 0);
++		net_fcntl(server, F_SETFL, (flags < 0 ? 0 : flags) | IOS_O_NONBLOCK);
++		evlog("video listening on port %d", port);
++		return server;
++	}
++	evlog("video: no free port in %d..%d", EVNET_VIDEO_PORT, EVNET_VIDEO_PORT + VIDEO_PORT_COUNT - 1);
++	return -1;
++}
++
++static void* vidMain(void* arg) {
++	(void) arg;
++	for (;;) {
++		while (!evNetUp) {
++			usleep(200000);
++		}
++		s32 server = vidOpenServer();
++		if (server < 0) {
++			sleep(2);
++			continue;
++		}
++		vidServerSock = server;
++		int failures = 0;
++		while (evNetUp && failures < 50) {
++			struct sockaddr_in peer;
++			socklen_t peerLen = sizeof(peer);
++			s32 client = net_accept(server, (struct sockaddr*) &peer, &peerLen);
++			if (client < 0) {
++				if (client != -EAGAIN && client != -EWOULDBLOCK) {
++					++failures;
++				}
++				usleep(100000);
++				continue;
++			}
++			failures = 0;
++			s32 flags = net_fcntl(client, F_GETFL, 0);
++			net_fcntl(client, F_SETFL, (flags < 0 ? 0 : flags) & ~IOS_O_NONBLOCK);
++			vidClientSock = client;
++			vidServe(client);
++			vidClientSock = -1;
++			net_close(client);
++		}
++		vidServerSock = -1;
++		net_close(server);
++		sleep(1);
++	}
++	return NULL;
++}
++
 +static void* evMain(void* arg) {
 +	(void) arg;
 +	evlog("server thread running");
@@ -308,6 +631,7 @@ index 0000000..8e60c48
 +			continue;
 +		}
 +		evServerSock = server;
++		evNetUp = true;
 +		int failures = 0;
 +		while (failures < 5) {
 +			struct sockaddr_in peer;
@@ -327,6 +651,7 @@ index 0000000..8e60c48
 +		}
 +		/* the listening socket looks dead: build everything again */
 +		evlog("rebuilding the network stack");
++		evNetUp = false;
 +		evServerSock = -1;
 +		net_close(server);
 +		net_deinit();
@@ -341,6 +666,13 @@ index 0000000..8e60c48
 +	}
 +	if (evServerSock >= 0) {
 +		net_close(evServerSock);
++	}
++	evNetUp = false;
++	if (vidClientSock >= 0) {
++		net_close(vidClientSock);
++	}
++	if (vidServerSock >= 0) {
++		net_close(vidServerSock);
 +	}
 +	net_deinit();
 +	evlog("exit: sockets released");
@@ -363,6 +695,18 @@ index 0000000..8e60c48
 +		evlog("game loaded, server thread created");
 +	} else {
 +		evlog("LWP_CreateThread failed: %d", (int) res);
++		return;
++	}
++	if (LWP_MutexInit(&vidLock, false) != 0) {
++		vidLock = LWP_MUTEX_NULL;
++		evlog("video: LWP_MutexInit failed");
++		return;
++	}
++	res = LWP_CreateThread(&vidThread, vidMain, NULL, NULL, 16 * 1024, VIDEO_PRIORITY);
++	if (res == 0) {
++		evlog("video thread created");
++	} else {
++		evlog("video: LWP_CreateThread failed: %d", (int) res);
 +	}
 +}
 +
@@ -377,10 +721,10 @@ index 0000000..8e60c48
 +}
 diff --git a/src/platform/wii/evnet.h b/src/platform/wii/evnet.h
 new file mode 100644
-index 0000000..d4f6fc5
+index 0000000..6bd20a9
 --- /dev/null
 +++ b/src/platform/wii/evnet.h
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,14 @@
 +/* EV Counter: streams GBA memory over TCP so a PC can read it live. */
 +#ifndef EVNET_H
 +#define EVNET_H
@@ -391,10 +735,12 @@ index 0000000..d4f6fc5
 +
 +void evnet_start(struct mCore* core);
 +void evnet_stop(void);
++/* the emulator's output buffer after each frame: RGB565, stride in pixels */
++void evnet_frame(const void* pixels, unsigned stride, unsigned w, unsigned h);
 +
 +#endif
 diff --git a/src/platform/wii/main.c b/src/platform/wii/main.c
-index 4cdbc33..4f61020 100644
+index 4cdbc33..ecf0ba3 100644
 --- a/src/platform/wii/main.c
 +++ b/src/platform/wii/main.c
 @@ -17,6 +17,7 @@
@@ -421,3 +767,11 @@ index 4cdbc33..4f61020 100644
  	reconfigureScreen(runner);
  	if (runner->core->platform(runner->core) == mPLATFORM_GBA && ((struct GBA*) runner->core->board)->memory.hw.devices & HW_GYRO) {
  		int i;
+@@ -1515,6 +1518,7 @@ void _prepareForFrame(struct mGUIRunner* runner) {
+ 
+ void _drawFrame(struct mGUIRunner* runner, bool faded) {
+ 	runner->core->desiredVideoDimensions(runner->core, &corew, &coreh);
++	evnet_frame(outputBuffer, TEX_W, corew, coreh);
+ 	uint32_t color = 0xFFFFFF3F;
+ 	if (!faded) {
+ 		color |= 0xC0;
