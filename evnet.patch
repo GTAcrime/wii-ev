@@ -13,26 +13,26 @@ index 3fead14..4a229e5 100644
  if(WIIDRC_LIBRARY)
 diff --git a/src/platform/wii/evnet.c b/src/platform/wii/evnet.c
 new file mode 100644
-index 0000000..923d37b
+index 0000000..b3c831a
 --- /dev/null
 +++ b/src/platform/wii/evnet.c
-@@ -0,0 +1,803 @@
+@@ -0,0 +1,896 @@
 +/* EV Counter: streams GBA memory over TCP so a PC can read it live.
 + *
 + * The Wii listens on EVNET_PORT. A client receives a stream of messages:
 + *   magic 'EVM1' (4 bytes), GBA address (u32), length (u32)  -- big-endian header
 + *   followed by <length> bytes of GBA memory in GBA (little-endian) byte order.
 + *
-+ * Video (WiiScreen on the PC): a second server on EVNET_VIDEO_PORT sends the emulated screen, one message
-+ * per emulated frame:
-+ *   magic 'EVF1', frame number (u32), width (u16), height (u16), payload length (u32)  -- big-endian
-+ *   payload: changed-row bit mask ((height + 7) / 8 bytes, bit 7 of byte 0 = row 0), then one LZ4 block
-+ *   holding the changed rows one after another, pixels RGB565 big-endian (as in mGBA's output buffer).
-+ *   A message with width 0 / height 0 and no payload is a keep-alive (no game running).
-+ * Sound goes on the same connection, sent before any picture (a slow network drops frames, not sound):
-+ *   magic 'EVA1', total samples sent before this block (u32), sample count n (u16), format (u16, 1 = PCM),
-+ *   payload length (u32); payload: n stereo samples, s16 big-endian, left then right, 24 kHz (mGBA's 48 kHz
-+ *   averaged in pairs: 96 KB/s; IMA ADPCM was tried: it measured poorly on the GBA's square waves).
++ * Video (WiiScreen on the PC): a second server on EVNET_VIDEO_PORT. Every message has a 16-byte big-endian header:
++ *   magic (4), a (u32), b (u16), c (u16), payload length (u32). Each pass of the sender loop sends ALL its messages
++ *   with one vidSendAll (every IOS send call costs time).
++ *   'EVA1' sound, sent first: a = samples sent before, b = n, c = 1 (PCM); payload n stereo samples s16 BE,
++ *          left then right, 24 kHz (mGBA's 48 kHz averaged in pairs, ~95 KB/s). IMA ADPCM measured poorly.
++ *   'EVF2' picture: a = frame number, b = width, c = height (0 x 0 = keep-alive). Payload: dx s8, dy s8, 0, 0;
++ *          2-bit row modes ((h * 2 + 7) / 8 bytes, row 0 in the top bits: 0 same, 1 raw, 2 xor); one LZ4 block
++ *          with the raw / xor rows. Reference row = previous frame moved by (dx, dy) (scrolling), zero outside.
++ *          Pixels RGB565 big-endian, as in mGBA's output buffer.
++ *   'EVS1' once a second: frames sent, frames skipped, encode us, send us, longest send us, send calls (u32 each).
 + * The video thread runs BELOW the emulator's priority and takes the newest frame each time, so a slow
 + * network only lowers the frame rate on the PC; the game never waits for it. Port 5555 is unchanged.
 + *
@@ -49,6 +49,7 @@ index 0000000..923d37b
 +#include <network.h>
 +#include <ogcsys.h>
 +#include <ogc/lwp.h>
++#include <ogc/lwp_watchdog.h>
 +#include <ogc/mutex.h>
 +#include <stdarg.h>
 +#include <stdio.h>
@@ -318,11 +319,16 @@ index 0000000..923d37b
 +#define VIDEO_MAX_H 160
 +#define VIDEO_PIXELS (VIDEO_MAX_W * VIDEO_MAX_H)
 +#define VIDEO_SEND_CHUNK 8192
-+#define VIDEO_KEEPALIVE_US 1000000
++#define VIDEO_KEEPALIVE_MS 1000
 +#define VIDEO_HEADER 16
-+#define VIDEO_MASK_MAX ((VIDEO_MAX_H + 7) / 8)
++#define VIDEO_EXTRA 4             /* dx, dy, 0, 0 */
++#define VIDEO_MASK_MAX ((VIDEO_MAX_H * 2 + 7) / 8)
++#define VIDEO_SHIFT_MAX 4         /* walking / running / bike move the screen 1..4 pixels per frame */
 +#define LZ4_BOUND(n) ((n) + (n) / 255 + 16)
 +#define LZ4_HASH_BITS 12
++#define ROW_SAME 0
++#define ROW_RAW 1
++#define ROW_XOR 2
 +#ifndef IOS_O_NONBLOCK
 +#define IOS_O_NONBLOCK 0x04
 +#endif
@@ -332,22 +338,39 @@ index 0000000..923d37b
 +#ifndef F_SETFL
 +#define F_SETFL 4
 +#endif
++#ifndef SO_SNDBUF
++#define SO_SNDBUF 0x1001
++#endif
++
++#define AUDIO_RING 8192           /* stereo samples at 48 kHz (~170 ms); power of two */
++#define AUDIO_BLOCK 1024          /* 24 kHz stereo samples per message at most */
++#define AUDIO_FORMAT_PCM24 1
++#define STATS_LEN 24
 +
 +static volatile bool evNetUp = false;            /* set by evMain while the network stack is usable */
 +
 +static uint16_t vidShared[VIDEO_PIXELS];          /* newest frame, written by the emulator thread */
 +static uint16_t vidWork[VIDEO_PIXELS];            /* the frame being encoded */
-+static uint16_t vidPrev[VIDEO_PIXELS];            /* the last frame the client has */
-+static uint8_t vidRows[VIDEO_PIXELS * 2];         /* changed rows, back to back */
-+static uint8_t vidOut[VIDEO_HEADER + VIDEO_MASK_MAX + LZ4_BOUND(VIDEO_PIXELS * 2)];
++static uint16_t vidPrev[VIDEO_PIXELS];            /* the frame the client has */
++static uint16_t vidRefRow[VIDEO_MAX_W];
++static uint16_t vidRowsBuf[VIDEO_PIXELS];         /* raw / xor rows, back to back, before LZ4 */
++#define vidRows ((uint8_t*) vidRowsBuf)
++/* everything sent in one pass of the loop: all waiting sound + stats + one picture, ONE vidSendAll */
++static uint8_t txBuf[(AUDIO_RING / 2 / AUDIO_BLOCK + 1) * VIDEO_HEADER + AUDIO_RING * 2 + VIDEO_HEADER + STATS_LEN +
++                     VIDEO_HEADER + VIDEO_EXTRA + VIDEO_MASK_MAX + LZ4_BOUND(VIDEO_PIXELS * 2)];
 +static uint32_t lz4Table[1 << LZ4_HASH_BITS];
 +static volatile uint32_t vidSeq = 0;
 +static volatile unsigned vidW = 0, vidH = 0;
-+static volatile bool vidWanted = false;           /* a client is connected: only then frames are copied */
++static volatile bool vidWanted = false;           /* a client is connected: only then frames / sound are copied */
 +static mutex_t vidLock = LWP_MUTEX_NULL;
 +static lwp_t vidThread;
 +static s32 vidServerSock = -1;
 +static s32 vidClientSock = -1;
++
++static uint32_t audRing[AUDIO_RING];              /* samples as mGBA stores them for the Wii's DMA */
++static volatile uint32_t audWrite = 0;            /* written by the emulator (interrupts off), read by vidServe */
++static volatile uint32_t audRead = 0;
++static uint32_t audTotal = 0;
 +
 +/* Called by the emulator thread for every drawn frame. Never waits: if the video thread is copying the
 + * previous frame right now, this one is skipped. */
@@ -375,19 +398,6 @@ index 0000000..923d37b
 +	LWP_MutexUnlock(vidLock);
 +}
 +
-+static bool vidSendAll(s32 sock, const uint8_t* p, size_t len);
-+
-+/* ---- sound ---- */
-+#define AUDIO_RING 8192           /* stereo samples at 48 kHz (~170 ms); power of two */
-+#define AUDIO_BLOCK 1024          /* 24 kHz stereo samples per message at most */
-+#define AUDIO_FORMAT_PCM24 1
-+
-+static uint32_t audRing[AUDIO_RING];              /* samples as mGBA stores them for the Wii's DMA */
-+static volatile uint32_t audWrite = 0;            /* written by the emulator (interrupts off), read by vidServe */
-+static volatile uint32_t audRead = 0;
-+static uint32_t audTotal = 0;
-+static uint8_t audOut[VIDEO_HEADER + AUDIO_BLOCK * 4];
-+
 +/* Called by mGBA's _postAudioBuffer (interrupts disabled) with the samples it just made for the TV.
 + * Only copies into a ring; if the ring is full (the PC is not reading), the newest samples are dropped. */
 +void evnet_audio(const void* samples, unsigned count) {
@@ -407,41 +417,48 @@ index 0000000..923d37b
 +	audWrite = w + count;
 +}
 +
++static void putMsg(uint8_t* p, const char* magic, uint32_t a, unsigned b, unsigned c, uint32_t len) {
++	memcpy(p, magic, 4);
++	p[4] = a >> 24;
++	p[5] = a >> 16;
++	p[6] = a >> 8;
++	p[7] = a;
++	p[8] = b >> 8;
++	p[9] = b;
++	p[10] = c >> 8;
++	p[11] = c;
++	p[12] = len >> 24;
++	p[13] = len >> 16;
++	p[14] = len >> 8;
++	p[15] = len;
++}
++
++static void put32(uint8_t* p, uint32_t v) {
++	p[0] = v >> 24;
++	p[1] = v >> 16;
++	p[2] = v >> 8;
++	p[3] = v;
++}
++
 +static void audResetStream(void) {
 +	audRead = audWrite;
 +	audTotal = 0;
 +}
 +
-+/* Send everything waiting in the ring (pairs of 48 kHz samples -> one 24 kHz sample). False = client gone. */
-+static bool audSend(s32 client, bool* sent) {
++/* Append all waiting sound as EVA1 messages (pairs of 48 kHz samples -> one 24 kHz sample). Returns bytes. */
++static size_t audAppend(uint8_t* out) {
++	size_t pos = 0;
 +	for (;;) {
 +		uint32_t r = audRead;
 +		uint32_t n = (audWrite - r) / 2;
 +		if (!n) {
-+			return true;
++			return pos;
 +		}
 +		if (n > AUDIO_BLOCK) {
 +			n = AUDIO_BLOCK;
 +		}
-+		uint8_t* p = audOut;
-+		uint32_t len = n * 4;
-+		p[0] = 'E';
-+		p[1] = 'V';
-+		p[2] = 'A';
-+		p[3] = '1';
-+		p[4] = audTotal >> 24;
-+		p[5] = audTotal >> 16;
-+		p[6] = audTotal >> 8;
-+		p[7] = audTotal;
-+		p[8] = n >> 8;
-+		p[9] = n;
-+		p[10] = 0;
-+		p[11] = AUDIO_FORMAT_PCM24;
-+		p[12] = len >> 24;
-+		p[13] = len >> 16;
-+		p[14] = len >> 8;
-+		p[15] = len;
-+		uint8_t* d = p + VIDEO_HEADER;
++		putMsg(out + pos, "EVA1", audTotal, n, AUDIO_FORMAT_PCM24, n * 4);
++		uint8_t* d = out + pos + VIDEO_HEADER;
 +		uint32_t i;
 +		for (i = 0; i < n; ++i) {
 +			uint32_t a = audRing[(r + 2 * i) & (AUDIO_RING - 1)];
@@ -457,10 +474,7 @@ index 0000000..923d37b
 +		}
 +		audRead = r + 2 * n;
 +		audTotal += n;
-+		*sent = true;
-+		if (!vidSendAll(client, audOut, VIDEO_HEADER + len)) {
-+			return false;
-+		}
++		pos += VIDEO_HEADER + n * 4;
 +	}
 +}
 +
@@ -541,47 +555,102 @@ index 0000000..923d37b
 +	return op - dst;
 +}
 +
-+static void putHeader(uint32_t seq, unsigned w, unsigned h, uint32_t len) {
-+	uint8_t* p = vidOut;
-+	p[0] = 'E';
-+	p[1] = 'V';
-+	p[2] = 'F';
-+	p[3] = '1';
-+	p[4] = seq >> 24;
-+	p[5] = seq >> 16;
-+	p[6] = seq >> 8;
-+	p[7] = seq;
-+	p[8] = w >> 8;
-+	p[9] = w;
-+	p[10] = h >> 8;
-+	p[11] = h;
-+	p[12] = len >> 24;
-+	p[13] = len >> 16;
-+	p[14] = len >> 8;
-+	p[15] = len;
++/* The whole screen moved (walking): find (dx, dy) so that new(x, y) == prev(x + dx, y + dy) for most pixels.
++ * Checks 6 rows, every 2nd pixel, all shifts up to VIDEO_SHIFT_MAX. (0, 0) unless a shift is clearly better. */
++static void vidFindShift(unsigned w, unsigned h, int* outDx, int* outDy) {
++	int best = -1, bestDx = 0, bestDy = 0, still = 0, total = 0;
++	int dx, dy, k;
++	*outDx = *outDy = 0;
++	if (w <= 2 * VIDEO_SHIFT_MAX || h <= 2 * VIDEO_SHIFT_MAX) {
++		return;
++	}
++	for (dy = -VIDEO_SHIFT_MAX; dy <= VIDEO_SHIFT_MAX; ++dy) {
++		for (dx = -VIDEO_SHIFT_MAX; dx <= VIDEO_SHIFT_MAX; ++dx) {
++			int score = 0, count = 0;
++			for (k = 0; k < 6; ++k) {
++				unsigned y = VIDEO_SHIFT_MAX + (h - 2 * VIDEO_SHIFT_MAX) * (2 * k + 1) / 12;
++				const uint16_t* row = &vidWork[y * w];
++				const uint16_t* ref = &vidPrev[((int) y + dy) * (int) w + dx];
++				unsigned x;
++				for (x = VIDEO_SHIFT_MAX; x < w - VIDEO_SHIFT_MAX; x += 2) {
++					score += row[x] == ref[x];
++					++count;
++				}
++			}
++			total = count;
++			if (dx == 0 && dy == 0) {
++				still = score;
++			}
++			if (score > best) {
++				best = score;
++				bestDx = dx;
++				bestDy = dy;
++			}
++		}
++	}
++	if (best > still + total / 8 && best * 4 > total * 3) {
++		*outDx = bestDx;
++		*outDy = bestDy;
++	}
 +}
 +
-+/* Build the message for vidWork into vidOut: only rows that differ from vidPrev (all rows when full). */
-+static size_t vidEncode(uint32_t seq, unsigned w, unsigned h, bool full) {
-+	size_t maskLen = (h + 7) / 8;
-+	uint8_t* mask = vidOut + VIDEO_HEADER;
-+	size_t rowBytes = w * 2;
++/* EVF2 picture message for vidWork, appended at out. Each row is SAME (= reference row), RAW pixels, or XOR with
++ * the reference row (few pixels changed: compresses to almost nothing). The reference row is the previous frame
++ * moved by (dx, dy), zero outside it. Then vidPrev = vidWork. */
++static size_t vidEncode(uint8_t* out, uint32_t seq, unsigned w, unsigned h, bool full) {
++	int dx = 0, dy = 0;
++	if (!full) {
++		vidFindShift(w, h, &dx, &dy);
++	}
++	uint8_t* extra = out + VIDEO_HEADER;
++	extra[0] = (uint8_t) (int8_t) dx;
++	extra[1] = (uint8_t) (int8_t) dy;
++	extra[2] = extra[3] = 0;
++	uint8_t* mask = extra + VIDEO_EXTRA;
++	size_t maskLen = (h * 2 + 7) / 8;
 +	size_t n = 0;
-+	unsigned y;
++	unsigned y, x;
 +	memset(mask, 0, maskLen);
 +	for (y = 0; y < h; ++y) {
 +		const uint16_t* row = &vidWork[y * w];
-+		uint16_t* prev = &vidPrev[y * w];
-+		if (full || memcmp(row, prev, rowBytes) != 0) {
-+			mask[y >> 3] |= 0x80 >> (y & 7);
-+			memcpy(&vidRows[n], row, rowBytes);
-+			memcpy(prev, row, rowBytes);
-+			n += rowBytes;
++		unsigned mode = ROW_RAW;
++		if (!full) {
++			const uint16_t* ref = vidRefRow;
++			int sy = (int) y + dy;
++			if (dx == 0 && sy >= 0 && sy < (int) h) {
++				ref = &vidPrev[sy * w];
++			} else {
++				for (x = 0; x < w; ++x) {
++					int sx = (int) x + dx;
++					vidRefRow[x] = (sy >= 0 && sy < (int) h && sx >= 0 && sx < (int) w) ? vidPrev[sy * w + sx] : 0;
++				}
++			}
++			unsigned diff = 0;
++			for (x = 0; x < w; ++x) {
++				diff += row[x] != ref[x];
++			}
++			if (diff == 0) {
++				mode = ROW_SAME;
++			} else if (diff * 2 < w) {
++				mode = ROW_XOR;
++				uint16_t* o = (uint16_t*) &vidRows[n];
++				for (x = 0; x < w; ++x) {
++					o[x] = row[x] ^ ref[x];
++				}
++				n += w * 2;
++			}
 +		}
++		if (mode == ROW_RAW) {
++			memcpy(&vidRows[n], row, w * 2);
++			n += w * 2;
++		}
++		mask[y >> 2] |= mode << (6 - 2 * (y & 3));
 +	}
 +	size_t packed = n ? lz4Compress(vidRows, n, mask + maskLen) : 0;
-+	putHeader(seq, w, h, (uint32_t) (maskLen + packed));
-+	return VIDEO_HEADER + maskLen + packed;
++	memcpy(vidPrev, vidWork, w * h * 2);
++	uint32_t len = (uint32_t) (VIDEO_EXTRA + maskLen + packed);
++	putMsg(out, "EVF2", seq, w, h, len);
++	return VIDEO_HEADER + len;
 +}
 +
 +static bool vidSendAll(s32 sock, const uint8_t* p, size_t len) {
@@ -599,43 +668,67 @@ index 0000000..923d37b
 +static void vidServe(s32 client) {
 +	uint32_t lastSeq = vidSeq;
 +	unsigned lastW = 0, lastH = 0;
-+	unsigned idle = 0;
++	u64 lastSend = gettime(), statStart = gettime();
++	uint32_t stSent = 0, stSkipped = 0, stEncodeUs = 0, stSendUs = 0, stSendMaxUs = 0, stSends = 0;
++	int sndbuf = 64 * 1024;
++	if (net_setsockopt(client, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {
++		evlog("video: SO_SNDBUF not accepted, continuing");
++	}
 +	evlog("video client connected");
 +	vidWanted = true;
 +	audResetStream();
 +	for (;;) {
-+		bool sent = false;
-+		if (!audSend(client, &sent)) {             /* sound first: it must never wait behind a picture */
-+			break;
++		size_t pos = audAppend(txBuf);             /* sound first: it must never wait behind a picture */
++		bool frame = vidSeq != lastSeq && evCore;
++		if (frame) {
++			u64 t0 = gettime();
++			LWP_MutexLock(vidLock);
++			unsigned w = vidW, h = vidH;
++			uint32_t seq = vidSeq;
++			memcpy(vidWork, vidShared, w * h * 2);
++			LWP_MutexUnlock(vidLock);
++			stSkipped += seq - lastSeq - 1;
++			lastSeq = seq;
++			bool full = w != lastW || h != lastH;      /* first frame, or the screen size changed */
++			lastW = w;
++			lastH = h;
++			pos += vidEncode(txBuf + pos, seq, w, h, full);
++			stEncodeUs += (uint32_t) ticks_to_microsecs(diff_ticks(t0, gettime()));
++			++stSent;
 +		}
-+		if (sent) {
-+			idle = 0;
++		u64 now = gettime();
++		if (ticks_to_millisecs(diff_ticks(statStart, now)) >= 1000) {
++			uint8_t* p = txBuf + pos;
++			putMsg(p, "EVS1", 0, 0, 0, STATS_LEN);
++			put32(p + 16, stSent);
++			put32(p + 20, stSkipped);
++			put32(p + 24, stEncodeUs);
++			put32(p + 28, stSendUs);
++			put32(p + 32, stSendMaxUs);
++			put32(p + 36, stSends);
++			pos += VIDEO_HEADER + STATS_LEN;
++			stSent = stSkipped = stEncodeUs = stSendUs = stSendMaxUs = stSends = 0;
++			statStart = now;
 +		}
-+		if (vidSeq == lastSeq || !evCore) {
-+			usleep(2000);
-+			idle += 2000;
-+			if (idle >= VIDEO_KEEPALIVE_US) {         /* no frames (menu / no game): tell the PC we are alive */
-+				idle = 0;
-+				putHeader(lastSeq, 0, 0, 0);
-+				if (!vidSendAll(client, vidOut, VIDEO_HEADER)) {
-+					break;
-+				}
++		if (!pos && ticks_to_millisecs(diff_ticks(lastSend, now)) >= VIDEO_KEEPALIVE_MS) {
++			putMsg(txBuf, "EVF2", lastSeq, 0, 0, 0);   /* no frames (menu / no game): tell the PC we are alive */
++			pos = VIDEO_HEADER;
++		}
++		if (pos) {
++			u64 t1 = gettime();
++			if (!vidSendAll(client, txBuf, pos)) {
++				break;
 +			}
-+			continue;
++			lastSend = gettime();
++			uint32_t us = (uint32_t) ticks_to_microsecs(diff_ticks(t1, lastSend));
++			stSendUs += us;
++			if (us > stSendMaxUs) {
++				stSendMaxUs = us;
++			}
++			++stSends;
 +		}
-+		idle = 0;
-+		LWP_MutexLock(vidLock);
-+		unsigned w = vidW, h = vidH;
-+		uint32_t seq = vidSeq;
-+		memcpy(vidWork, vidShared, w * h * 2);
-+		LWP_MutexUnlock(vidLock);
-+		lastSeq = seq;
-+		bool full = w != lastW || h != lastH;          /* first frame, or the screen size changed */
-+		lastW = w;
-+		lastH = h;
-+		size_t len = vidEncode(seq, w, h, full);
-+		if (!vidSendAll(client, vidOut, len)) {
-+			break;
++		if (!frame) {
++			usleep(1000);
 +		}
 +	}
 +	vidWanted = false;
