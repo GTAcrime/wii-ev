@@ -13,10 +13,10 @@ index 3fead14..4a229e5 100644
  if(WIIDRC_LIBRARY)
 diff --git a/src/platform/wii/evnet.c b/src/platform/wii/evnet.c
 new file mode 100644
-index 0000000..ee90726
+index 0000000..923d37b
 --- /dev/null
 +++ b/src/platform/wii/evnet.c
-@@ -0,0 +1,702 @@
+@@ -0,0 +1,803 @@
 +/* EV Counter: streams GBA memory over TCP so a PC can read it live.
 + *
 + * The Wii listens on EVNET_PORT. A client receives a stream of messages:
@@ -29,6 +29,10 @@ index 0000000..ee90726
 + *   payload: changed-row bit mask ((height + 7) / 8 bytes, bit 7 of byte 0 = row 0), then one LZ4 block
 + *   holding the changed rows one after another, pixels RGB565 big-endian (as in mGBA's output buffer).
 + *   A message with width 0 / height 0 and no payload is a keep-alive (no game running).
++ * Sound goes on the same connection, sent before any picture (a slow network drops frames, not sound):
++ *   magic 'EVA1', total samples sent before this block (u32), sample count n (u16), format (u16, 1 = PCM),
++ *   payload length (u32); payload: n stereo samples, s16 big-endian, left then right, 24 kHz (mGBA's 48 kHz
++ *   averaged in pairs: 96 KB/s; IMA ADPCM was tried: it measured poorly on the GBA's square waves).
 + * The video thread runs BELOW the emulator's priority and takes the newest frame each time, so a slow
 + * network only lowers the frame rate on the PC; the game never waits for it. Port 5555 is unchanged.
 + *
@@ -371,6 +375,95 @@ index 0000000..ee90726
 +	LWP_MutexUnlock(vidLock);
 +}
 +
++static bool vidSendAll(s32 sock, const uint8_t* p, size_t len);
++
++/* ---- sound ---- */
++#define AUDIO_RING 8192           /* stereo samples at 48 kHz (~170 ms); power of two */
++#define AUDIO_BLOCK 1024          /* 24 kHz stereo samples per message at most */
++#define AUDIO_FORMAT_PCM24 1
++
++static uint32_t audRing[AUDIO_RING];              /* samples as mGBA stores them for the Wii's DMA */
++static volatile uint32_t audWrite = 0;            /* written by the emulator (interrupts off), read by vidServe */
++static volatile uint32_t audRead = 0;
++static uint32_t audTotal = 0;
++static uint8_t audOut[VIDEO_HEADER + AUDIO_BLOCK * 4];
++
++/* Called by mGBA's _postAudioBuffer (interrupts disabled) with the samples it just made for the TV.
++ * Only copies into a ring; if the ring is full (the PC is not reading), the newest samples are dropped. */
++void evnet_audio(const void* samples, unsigned count) {
++	if (!vidWanted || !samples) {
++		return;
++	}
++	const uint32_t* src = samples;
++	uint32_t w = audWrite;
++	uint32_t room = AUDIO_RING - (w - audRead);
++	if (count > room) {
++		count = room;
++	}
++	unsigned i;
++	for (i = 0; i < count; ++i) {
++		audRing[(w + i) & (AUDIO_RING - 1)] = src[i];
++	}
++	audWrite = w + count;
++}
++
++static void audResetStream(void) {
++	audRead = audWrite;
++	audTotal = 0;
++}
++
++/* Send everything waiting in the ring (pairs of 48 kHz samples -> one 24 kHz sample). False = client gone. */
++static bool audSend(s32 client, bool* sent) {
++	for (;;) {
++		uint32_t r = audRead;
++		uint32_t n = (audWrite - r) / 2;
++		if (!n) {
++			return true;
++		}
++		if (n > AUDIO_BLOCK) {
++			n = AUDIO_BLOCK;
++		}
++		uint8_t* p = audOut;
++		uint32_t len = n * 4;
++		p[0] = 'E';
++		p[1] = 'V';
++		p[2] = 'A';
++		p[3] = '1';
++		p[4] = audTotal >> 24;
++		p[5] = audTotal >> 16;
++		p[6] = audTotal >> 8;
++		p[7] = audTotal;
++		p[8] = n >> 8;
++		p[9] = n;
++		p[10] = 0;
++		p[11] = AUDIO_FORMAT_PCM24;
++		p[12] = len >> 24;
++		p[13] = len >> 16;
++		p[14] = len >> 8;
++		p[15] = len;
++		uint8_t* d = p + VIDEO_HEADER;
++		uint32_t i;
++		for (i = 0; i < n; ++i) {
++			uint32_t a = audRing[(r + 2 * i) & (AUDIO_RING - 1)];
++			uint32_t b = audRing[(r + 2 * i + 1) & (AUDIO_RING - 1)];
++			/* mGBA's Wii buffer has the channels swapped ("reversed for AUDIO_InitDMA"): the first s16 field holds
++			 * the right channel. Read as one u32 on the big-endian Wii: high half = right, low half = left. */
++			int left = ((int16_t) (a & 0xFFFF) + (int16_t) (b & 0xFFFF)) >> 1;
++			int right = ((int16_t) (a >> 16) + (int16_t) (b >> 16)) >> 1;
++			d[4 * i] = (uint8_t) (left >> 8);
++			d[4 * i + 1] = (uint8_t) left;
++			d[4 * i + 2] = (uint8_t) (right >> 8);
++			d[4 * i + 3] = (uint8_t) right;
++		}
++		audRead = r + 2 * n;
++		audTotal += n;
++		*sent = true;
++		if (!vidSendAll(client, audOut, VIDEO_HEADER + len)) {
++			return false;
++		}
++	}
++}
++
 +static inline uint32_t rd32(const uint8_t* p) {
 +	uint32_t v;
 +	memcpy(&v, p, 4);
@@ -509,7 +602,15 @@ index 0000000..ee90726
 +	unsigned idle = 0;
 +	evlog("video client connected");
 +	vidWanted = true;
++	audResetStream();
 +	for (;;) {
++		bool sent = false;
++		if (!audSend(client, &sent)) {             /* sound first: it must never wait behind a picture */
++			break;
++		}
++		if (sent) {
++			idle = 0;
++		}
 +		if (vidSeq == lastSeq || !evCore) {
 +			usleep(2000);
 +			idle += 2000;
@@ -721,10 +822,10 @@ index 0000000..ee90726
 +}
 diff --git a/src/platform/wii/evnet.h b/src/platform/wii/evnet.h
 new file mode 100644
-index 0000000..6bd20a9
+index 0000000..ef01cea
 --- /dev/null
 +++ b/src/platform/wii/evnet.h
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,16 @@
 +/* EV Counter: streams GBA memory over TCP so a PC can read it live. */
 +#ifndef EVNET_H
 +#define EVNET_H
@@ -737,10 +838,12 @@ index 0000000..6bd20a9
 +void evnet_stop(void);
 +/* the emulator's output buffer after each frame: RGB565, stride in pixels */
 +void evnet_frame(const void* pixels, unsigned stride, unsigned w, unsigned h);
++/* the samples mGBA just put into its Wii audio buffer (struct mStereoSample, 48 kHz) */
++void evnet_audio(const void* samples, unsigned count);
 +
 +#endif
 diff --git a/src/platform/wii/main.c b/src/platform/wii/main.c
-index 4cdbc33..ecf0ba3 100644
+index 4cdbc33..c0ee5f2 100644
 --- a/src/platform/wii/main.c
 +++ b/src/platform/wii/main.c
 @@ -17,6 +17,7 @@
@@ -751,7 +854,15 @@ index 4cdbc33..ecf0ba3 100644
  #include <mgba/internal/gb/video.h>
  #include <mgba/internal/gba/audio.h>
  #include <mgba/internal/gba/gba.h>
-@@ -1434,6 +1435,7 @@ void _setup(struct mGUIRunner* runner) {
+@@ -705,6 +706,7 @@ static void _postAudioBuffer(struct mAVStream* stream, blip_t* left, blip_t* rig
+ 		// These appear to be reversed for AUDIO_InitDMA
+ 		blip_read_samples(left, &buffer->samples[buffer->size].right, available, true);
+ 		blip_read_samples(right, &buffer->samples[buffer->size].left, available, true);
++		evnet_audio(&buffer->samples[buffer->size], available);
+ 		buffer->size += available;
+ 	}
+ 	if (buffer->size == SAMPLES) {
+@@ -1434,6 +1436,7 @@ void _setup(struct mGUIRunner* runner) {
  
  void _gameUnloaded(struct mGUIRunner* runner) {
  	UNUSED(runner);
@@ -759,7 +870,7 @@ index 4cdbc33..ecf0ba3 100644
  	AUDIO_StopDMA();
  	frameLimiter = true;
  	VIDEO_SetBlack(true);
-@@ -1442,6 +1444,7 @@ void _gameUnloaded(struct mGUIRunner* runner) {
+@@ -1442,6 +1445,7 @@ void _gameUnloaded(struct mGUIRunner* runner) {
  }
  
  void _gameLoaded(struct mGUIRunner* runner) {
@@ -767,7 +878,7 @@ index 4cdbc33..ecf0ba3 100644
  	reconfigureScreen(runner);
  	if (runner->core->platform(runner->core) == mPLATFORM_GBA && ((struct GBA*) runner->core->board)->memory.hw.devices & HW_GYRO) {
  		int i;
-@@ -1515,6 +1518,7 @@ void _prepareForFrame(struct mGUIRunner* runner) {
+@@ -1515,6 +1519,7 @@ void _prepareForFrame(struct mGUIRunner* runner) {
  
  void _drawFrame(struct mGUIRunner* runner, bool faded) {
  	runner->core->desiredVideoDimensions(runner->core, &corew, &coreh);
