@@ -39,10 +39,10 @@ index 3fead14..4a229e5 100644
  if(WIIDRC_LIBRARY)
 diff --git a/src/platform/wii/evnet.c b/src/platform/wii/evnet.c
 new file mode 100644
-index 0000000..6402507
+index 0000000..0bc99ba
 --- /dev/null
 +++ b/src/platform/wii/evnet.c
-@@ -0,0 +1,923 @@
+@@ -0,0 +1,980 @@
 +/* EV Counter: streams GBA memory over TCP so a PC can read it live.
 + *
 + * The Wii listens on EVNET_PORT. A client receives a stream of messages:
@@ -167,15 +167,42 @@ index 0000000..6402507
 +/* one tick worth of data, filled while reading the core, sent afterwards */
 +static uint8_t outBuf[(12 + 32) + 2 * 16 + (12 + PARTY_BLOCK_SIZE) + (12 + RS_PARTY_BLOCK_SIZE) + 2 * (12 + CHUNK)];
 +
++#ifndef IOS_O_NONBLOCK
++#define IOS_O_NONBLOCK 0x04
++#endif
++#ifndef F_GETFL
++#define F_GETFL 3
++#endif
++#ifndef F_SETFL
++#define F_SETFL 4
++#endif
++#define EVNET_SEND_TIMEOUT_MS 1500 /* a client that does not read for this long is dropped */
++
++static void setNonBlocking(s32 sock) {
++	s32 flags = net_fcntl(sock, F_GETFL, 0);
++	net_fcntl(sock, F_SETFL, (flags < 0 ? 0 : flags) | IOS_O_NONBLOCK);
++}
++
++static bool wouldBlock(s32 res) {
++	return res == -EAGAIN || res == -EWOULDBLOCK;
++}
++
++/* Sockets are non-blocking: a dead or stalled client can never hang the server thread. */
 +static bool sendAll(s32 sock, const void* data, size_t len) {
 +	const uint8_t* p = data;
++	u64 start = gettime();
 +	while (len > 0) {
 +		s32 n = net_send(sock, p, len > 1024 ? 1024 : (s32) len, 0);
-+		if (n <= 0) {
++		if (n > 0) {
++			p += n;
++			len -= n;
++			start = gettime();
++			continue;
++		}
++		if (!wouldBlock(n) || ticks_to_millisecs(diff_ticks(start, gettime())) >= EVNET_SEND_TIMEOUT_MS) {
 +			return false;
 +		}
-+		p += n;
-+		len -= n;
++		usleep(5000);
 +	}
 +	return true;
 +}
@@ -294,19 +321,38 @@ index 0000000..6402507
 +	return pos;
 +}
 +
-+static void serve(s32 client) {
++/* Streams to one client. Returns a NEW client's socket when someone connects (it replaces the current one,
++ * so a restarted EV Counter takes over at once) or -1 when the current client is gone. */
++static s32 serve(s32 server, s32 client) {
 +	uint32_t chunk = 0;
 +	evlog("client connected");
 +	for (;;) {
 +		size_t len = buildTick(&chunk);
 +		if (len && !sendAll(client, outBuf, len)) {
-+			evlog("client gone (send failed)");
-+			return;
++			evlog("client gone (send failed or stalled)");
++			return -1;
 +		}
-+		if (evScanning) {
-+			continue; /* still looking for gBaseStats: keep going without waiting */
++		int waits = evScanning ? 1 : 2; /* still looking for gBaseStats: keep going without waiting */
++		int w;
++		for (w = 0; w < waits; ++w) {
++			struct sockaddr_in peer;
++			socklen_t peerLen = sizeof(peer);
++			s32 next = net_accept(server, (struct sockaddr*) &peer, &peerLen);
++			if (next >= 0) {
++				setNonBlocking(next);
++				evlog("new client replaces the old one");
++				return next;
++			}
++			uint8_t scratch[16];
++			s32 r = net_recv(client, scratch, sizeof(scratch), 0);
++			if (r == 0 || (r < 0 && !wouldBlock(r))) {
++				evlog("client gone (recv %d)", (int) r);
++				return -1;
++			}
++			if (!evScanning) {
++				usleep(TICK_US / 2);
++			}
 +		}
-+		usleep(TICK_US);
 +	}
 +}
 +
@@ -347,12 +393,13 @@ index 0000000..6402507
 +		net_close(server);
 +		return -1;
 +	}
-+	res = net_listen(server, 1);
++	res = net_listen(server, 2);
 +	if (res < 0) {
 +		evlog("net_listen failed on port %d: %d", port, (int) res);
 +		net_close(server);
 +		return -1;
 +	}
++	setNonBlocking(server); /* a blocking accept would hold up every other IOS network call */
 +	evlog("listening on port %d", port);
 +	return server;
 +}
@@ -880,21 +927,31 @@ index 0000000..6402507
 +		evServerSock = server;
 +		evNetUp = true;
 +		int failures = 0;
++		s32 client = -1;
 +		while (failures < 5) {
-+			struct sockaddr_in peer;
-+			socklen_t peerLen = sizeof(peer);
-+			s32 client = net_accept(server, (struct sockaddr*) &peer, &peerLen);
 +			if (client < 0) {
-+				++failures;
-+				evlog("net_accept failed: %d (failure %d)", (int) client, failures);
-+				sleep(1);
-+				continue;
++				struct sockaddr_in peer;
++				socklen_t peerLen = sizeof(peer);
++				client = net_accept(server, (struct sockaddr*) &peer, &peerLen);
++				if (client < 0) {
++					if (!wouldBlock(client)) {
++						++failures;
++						evlog("net_accept failed: %d (failure %d)", (int) client, failures);
++						sleep(1);
++					} else {
++						usleep(100000);
++					}
++					client = -1;
++					continue;
++				}
++				setNonBlocking(client);
 +			}
 +			failures = 0;
 +			evClientSock = client;
-+			serve(client);
++			s32 next = serve(server, client);
 +			evClientSock = -1;
 +			net_close(client);
++			client = next;
 +		}
 +		/* the listening socket looks dead: build everything again */
 +		evlog("rebuilding the network stack");
