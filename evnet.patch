@@ -1048,7 +1048,7 @@ index 0000000..4baec7f
 +
 +#endif
 diff --git a/src/platform/wii/main.c b/src/platform/wii/main.c
-index 4cdbc33..c0ee5f2 100644
+index 4cdbc33..9350c49 100644
 --- a/src/platform/wii/main.c
 +++ b/src/platform/wii/main.c
 @@ -17,6 +17,7 @@
@@ -1059,7 +1059,24 @@ index 4cdbc33..c0ee5f2 100644
  #include <mgba/internal/gb/video.h>
  #include <mgba/internal/gba/audio.h>
  #include <mgba/internal/gba/gba.h>
-@@ -705,6 +706,7 @@ static void _postAudioBuffer(struct mAVStream* stream, blip_t* left, blip_t* rig
+@@ -95,6 +96,7 @@ static struct GUIParams* params; // XXX
+ static void _setup(struct mGUIRunner* runner);
+ static void _gameLoaded(struct mGUIRunner* runner);
+ static void _gameUnloaded(struct mGUIRunner* runner);
++static void _paused(struct mGUIRunner* runner);
+ static void _unpaused(struct mGUIRunner* runner);
+ static void _prepareForFrame(struct mGUIRunner* runner);
+ static void _drawFrame(struct mGUIRunner* runner, bool faded);
+@@ -594,7 +596,7 @@ int main(int argc, char* argv[]) {
+ 		.gameUnloaded = _gameUnloaded,
+ 		.prepareForFrame = _prepareForFrame,
+ 		.drawFrame = _drawFrame,
+-		.paused = _gameUnloaded,
++		.paused = _paused,
+ 		.unpaused = _unpaused,
+ 		.incrementScreenMode = _incrementScreenMode,
+ 		.setFrameLimiter = _setFrameLimiter,
+@@ -705,6 +707,7 @@ static void _postAudioBuffer(struct mAVStream* stream, blip_t* left, blip_t* rig
  		// These appear to be reversed for AUDIO_InitDMA
  		blip_read_samples(left, &buffer->samples[buffer->size].right, available, true);
  		blip_read_samples(right, &buffer->samples[buffer->size].left, available, true);
@@ -1067,15 +1084,20 @@ index 4cdbc33..c0ee5f2 100644
  		buffer->size += available;
  	}
  	if (buffer->size == SAMPLES) {
-@@ -1434,6 +1436,7 @@ void _setup(struct mGUIRunner* runner) {
+@@ -1433,6 +1436,12 @@ void _setup(struct mGUIRunner* runner) {
+ }
  
  void _gameUnloaded(struct mGUIRunner* runner) {
- 	UNUSED(runner);
 +	evnet_stop();
++	_paused(runner);
++}
++
++/* The pause menu (L, "Reset game") keeps the game loaded, so the EV stream must keep reading it. */
++void _paused(struct mGUIRunner* runner) {
+ 	UNUSED(runner);
  	AUDIO_StopDMA();
  	frameLimiter = true;
- 	VIDEO_SetBlack(true);
-@@ -1442,6 +1445,7 @@ void _gameUnloaded(struct mGUIRunner* runner) {
+@@ -1442,6 +1451,7 @@ void _gameUnloaded(struct mGUIRunner* runner) {
  }
  
  void _gameLoaded(struct mGUIRunner* runner) {
@@ -1083,7 +1105,7 @@ index 4cdbc33..c0ee5f2 100644
  	reconfigureScreen(runner);
  	if (runner->core->platform(runner->core) == mPLATFORM_GBA && ((struct GBA*) runner->core->board)->memory.hw.devices & HW_GYRO) {
  		int i;
-@@ -1515,6 +1519,7 @@ void _prepareForFrame(struct mGUIRunner* runner) {
+@@ -1515,6 +1525,7 @@ void _prepareForFrame(struct mGUIRunner* runner) {
  
  void _drawFrame(struct mGUIRunner* runner, bool faded) {
  	runner->core->desiredVideoDimensions(runner->core, &corew, &coreh);
