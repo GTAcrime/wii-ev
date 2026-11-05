@@ -39,10 +39,10 @@ index 3fead14..4a229e5 100644
  if(WIIDRC_LIBRARY)
 diff --git a/src/platform/wii/evnet.c b/src/platform/wii/evnet.c
 new file mode 100644
-index 0000000..0bc99ba
+index 0000000..5788fed
 --- /dev/null
 +++ b/src/platform/wii/evnet.c
-@@ -0,0 +1,980 @@
+@@ -0,0 +1,983 @@
 +/* EV Counter: streams GBA memory over TCP so a PC can read it live.
 + *
 + * The Wii listens on EVNET_PORT. A client receives a stream of messages:
@@ -137,6 +137,8 @@ index 0000000..0bc99ba
 +#define PARTY_BLOCK 0x0202402C    /* covers gEnemyParty+gPlayerParty of FireRed AND Emerald */
 +#define PARTY_BLOCK_SIZE 2328
 +#define RS_PARTY_BLOCK 0x03004360 /* covers gPlayerParty+gEnemyParty of Ruby AND Sapphire (in IWRAM) */
++#define RS_MAIN_BLOCK 0x03001770  /* gMain of Ruby/Sapphire: inBattle flag at +0x43D, needed to reveal the starter at once */
++#define RS_MAIN_BLOCK_SIZE 0x440
 +#define RS_PARTY_BLOCK_SIZE 700   /* 0x03004360 + 600 = 0x030045B8 (player), 0x030045C0 + 100 = 0x03004624 (enemy) */
 +#define CHUNKS ((IWRAM_SIZE + EWRAM_SIZE + ROM_BASESTATS_SIZE) / CHUNK)
 +
@@ -165,7 +167,7 @@ index 0000000..0bc99ba
 +}
 +
 +/* one tick worth of data, filled while reading the core, sent afterwards */
-+static uint8_t outBuf[(12 + 32) + 2 * 16 + (12 + PARTY_BLOCK_SIZE) + (12 + RS_PARTY_BLOCK_SIZE) + 2 * (12 + CHUNK)];
++static uint8_t outBuf[(12 + 32) + 2 * 16 + (12 + PARTY_BLOCK_SIZE) + (12 + RS_PARTY_BLOCK_SIZE) + (12 + RS_MAIN_BLOCK_SIZE) + 2 * (12 + CHUNK)];
 +
 +#ifndef IOS_O_NONBLOCK
 +#define IOS_O_NONBLOCK 0x04
@@ -294,7 +296,8 @@ index 0000000..0bc99ba
 +			uint32_t gameCode = core->rawRead32(core, HEADER_ADDR + 0x0C, -1);
 +			if (gameCode == 0x45565841 /* 'AXVE' */ || gameCode == 0x45505841 /* 'AXPE' */) {
 +				pos = appendRegion(pos, core, RS_PARTY_BLOCK, RS_PARTY_BLOCK_SIZE);
-+			}
++								pos = appendRegion(pos, core, RS_MAIN_BLOCK, RS_MAIN_BLOCK_SIZE);
++							}
 +		}
 +		int k;
 +		for (k = 0; k < 2; ++k) {
